@@ -97,6 +97,13 @@ type Manager struct {
 	// DB-backed servers
 	store store.MCPServerStore
 
+	// Optional agent store. When set, LoadForAgent looks up the agent's
+	// human-readable key (slug) and propagates it to outbound MCP connections
+	// as the X-GoClaw-Agent-Key header. Lets downstream MCP servers attribute
+	// tool calls to a specific agent for governance (per-agent caps, dept
+	// scoping). Without this, headers are server-default only.
+	agentStore store.AgentCRUDStore
+
 	// Grant checker for runtime grant verification (nil = skip check)
 	grantChecker GrantChecker
 
@@ -131,6 +138,22 @@ func WithConfigs(cfgs map[string]*config.MCPServerConfig) ManagerOption {
 func WithStore(s store.MCPServerStore) ManagerOption {
 	return func(m *Manager) {
 		m.store = s
+	}
+}
+
+// WithAgentStore enables agent-key header propagation on outbound MCP calls.
+// When set, LoadForAgent resolves the agent's human-readable key and injects
+// X-GoClaw-Agent-Key: <key> into the connection headers. Downstream MCP
+// servers can use this to attribute tool calls to a specific agent (e.g. for
+// per-department spend caps or tool-scope enforcement).
+//
+// Side effect: per-agent header injection forces each agent to use a
+// dedicated connection rather than the shared pool, since headers must
+// differ per agent. For deployments with many agents the loss of pooling
+// may be measurable; for typical single-org setups it is negligible.
+func WithAgentStore(s store.AgentCRUDStore) ManagerOption {
+	return func(m *Manager) {
+		m.agentStore = s
 	}
 }
 
@@ -206,7 +229,12 @@ type resolvedServer struct {
 
 // resolveServerCredentials merges server defaults with per-user credentials.
 // Returns nil if the server should be skipped (disabled or missing required creds).
-func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAccessInfo, userID string) *resolvedServer {
+//
+// `agentKey` (when non-empty) is propagated as an X-GoClaw-Agent-Key header on
+// the outbound connection so downstream MCP servers can attribute tool calls
+// to a specific agent. See WithAgentStore for the trade-off (per-agent
+// connections, no pool sharing).
+func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAccessInfo, userID, agentKey string) *resolvedServer {
 	srv := info.Server
 	if !srv.Enabled {
 		return nil
@@ -275,6 +303,23 @@ func (m *Manager) resolveServerCredentials(ctx context.Context, info store.MCPAc
 		}
 	}
 
+	// Propagate the agent identity to downstream MCP servers as a request
+	// header. We skip if the connection is shared via the pool (no agent key)
+	// or if the server already declares this header explicitly. Any non-empty
+	// agentKey forces per-agent connection mode below.
+	if agentKey != "" {
+		if headers == nil {
+			headers = make(map[string]string)
+		}
+		// User-supplied X-GoClaw-Agent-Key wins over the auto-injected one,
+		// matching the rest of the credential-merge precedence.
+		if _, present := headers["X-GoClaw-Agent-Key"]; !present {
+			headers["X-GoClaw-Agent-Key"] = agentKey
+		}
+		// Per-agent header → can't share a pool connection across agents.
+		hasUserCreds = true
+	}
+
 	return &resolvedServer{
 		info:         info,
 		args:         args,
@@ -325,6 +370,18 @@ func (m *Manager) LoadForAgent(ctx context.Context, agentID uuid.UUID, userID st
 		return fmt.Errorf("list accessible MCP servers: %w", err)
 	}
 
+	// Resolve the agent's slug once if WithAgentStore is configured.
+	// Used to inject X-GoClaw-Agent-Key on outbound MCP connections so
+	// downstream servers can scope behavior per agent.
+	var agentKey string
+	if m.agentStore != nil && agentID != uuid.Nil {
+		if a, err := m.agentStore.GetByID(ctx, agentID); err == nil && a != nil {
+			agentKey = a.AgentKey
+		} else if err != nil {
+			slog.Debug("mcp.agent_key_lookup_failed", "agent_id", agentID, "error", err)
+		}
+	}
+
 	// Unregister all existing MCP tools first
 	m.unregisterAllTools()
 	m.userCredServers = nil
@@ -338,7 +395,7 @@ func (m *Manager) LoadForAgent(ctx context.Context, agentID uuid.UUID, userID st
 			continue
 		}
 
-		rs := m.resolveServerCredentials(ctx, info, userID)
+		rs := m.resolveServerCredentials(ctx, info, userID, agentKey)
 		if rs == nil {
 			continue
 		}
