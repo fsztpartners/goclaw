@@ -313,6 +313,12 @@ func NewManagedResolver(deps ResolverDeps) ResolverFunc {
 			if deps.MCPGrantChecker != nil {
 				mcpOpts = append(mcpOpts, mcpbridge.WithGrantChecker(deps.MCPGrantChecker))
 			}
+			if deps.AgentStore != nil {
+				// Propagate the agent's slug to outbound MCP calls so downstream
+				// servers (e.g. fzst-claw) can attribute calls per-agent for
+				// governance like dept-scoped tools and per-dept spend caps.
+				mcpOpts = append(mcpOpts, mcpbridge.WithAgentStore(deps.AgentStore))
+			}
 			mcpMgr := mcpbridge.NewManager(toolsReg, mcpOpts...)
 			if err := mcpMgr.LoadForAgent(ctx, ag.ID, ""); err != nil {
 				slog.Warn("failed to load MCP servers for agent", "agent", agentKey, "error", err)
