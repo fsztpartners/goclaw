@@ -111,8 +111,19 @@ func ValidateArgs(args []string) error {
 
 // ValidateURL checks URL for SSRF vulnerabilities using the existing security package.
 // This provides DNS rebinding protection via IP pinning.
+//
+// Dev escape hatch: when GOCLAW_MCP_ALLOW_LOOPBACK=1, the SSRF guard is skipped.
+// This is intended for single-machine local development where GoClaw runs
+// natively on the host alongside a local MCP server (e.g. Next.js on
+// localhost). MUST NOT be set in any environment that processes untrusted
+// user-supplied URLs — disabling the SSRF guard exposes cloud metadata
+// endpoints, RFC 1918 ranges, and loopback services.
 func ValidateURL(rawURL string) error {
 	if rawURL == "" {
+		return nil
+	}
+
+	if os.Getenv("GOCLAW_MCP_ALLOW_LOOPBACK") == "1" {
 		return nil
 	}
 
