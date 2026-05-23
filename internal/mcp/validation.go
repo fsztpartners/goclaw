@@ -2,12 +2,45 @@ package mcp
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/security"
 )
+
+// mcpAllowLoopback caches the GOCLAW_MCP_ALLOW_LOOPBACK env flag, read once
+// at package init so ValidateURL doesn't re-syscall on every check and the
+// activation is visible in startup logs. Accepted truthy values: "1",
+// "true", "yes" (case-insensitive, whitespace-trimmed).
+//
+// When true, ValidateURL dispatches to security.ValidateAllowLoopback which
+// permits loopback (127.0.0.0/8, ::1) and RFC 1918 ranges but still rejects
+// cloud-metadata (169.254.169.254), multicast, unspecified, non-http(s)
+// schemes, empty hosts, and bypasses DNS rebinding.
+var mcpAllowLoopback bool
+
+func init() {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GOCLAW_MCP_ALLOW_LOOPBACK")))
+	switch v {
+	case "1", "true", "yes":
+		mcpAllowLoopback = true
+		slog.Warn(
+			"mcp.validation: SSRF guard relaxed for loopback/RFC1918 (local-dev mode)",
+			"env", "GOCLAW_MCP_ALLOW_LOOPBACK",
+			"value", v,
+			"still_blocked", "cloud_metadata(169.254.169.254), multicast, unspecified, non-http_schemes, DNS_rebinding",
+		)
+	}
+}
+
+// SetAllowLoopbackForTest overrides the env-derived flag in tests. MUST NOT
+// be called from production code; use the GOCLAW_MCP_ALLOW_LOOPBACK env var
+// at startup instead.
+func SetAllowLoopbackForTest(allow bool) {
+	mcpAllowLoopback = allow
+}
 
 // Allowed commands for stdio transport (basename only).
 // This is a restrictive allowlist — only well-known runtimes are permitted.
@@ -109,26 +142,28 @@ func ValidateArgs(args []string) error {
 	return nil
 }
 
-// ValidateURL checks URL for SSRF vulnerabilities using the existing security package.
-// This provides DNS rebinding protection via IP pinning.
+// ValidateURL checks URL for SSRF vulnerabilities using the existing security
+// package. This provides DNS rebinding protection via IP pinning.
 //
-// Dev escape hatch: when GOCLAW_MCP_ALLOW_LOOPBACK=1, the SSRF guard is skipped.
-// This is intended for single-machine local development where GoClaw runs
-// natively on the host alongside a local MCP server (e.g. Next.js on
-// localhost). MUST NOT be set in any environment that processes untrusted
-// user-supplied URLs — disabling the SSRF guard exposes cloud metadata
-// endpoints, RFC 1918 ranges, and loopback services.
+// Dev mode (GOCLAW_MCP_ALLOW_LOOPBACK truthy at process startup): dispatches
+// to security.ValidateAllowLoopback so that loopback/RFC 1918 URLs are
+// accepted. This is intentionally narrow — cloud-metadata (169.254.169.254),
+// multicast, unspecified, non-http schemes, empty hosts, and DNS rebinding
+// remain rejected. Intended for single-machine local development where
+// GoClaw runs natively on the host alongside a local MCP server (e.g.
+// Next.js on http://localhost:3000). Operators must explicitly opt in; the
+// default is the strict guard.
 func ValidateURL(rawURL string) error {
 	if rawURL == "" {
 		return nil
 	}
 
-	if os.Getenv("GOCLAW_MCP_ALLOW_LOOPBACK") == "1" {
-		return nil
+	var err error
+	if mcpAllowLoopback {
+		_, _, err = security.ValidateAllowLoopback(rawURL)
+	} else {
+		_, _, err = security.Validate(rawURL)
 	}
-
-	// Reuse existing SSRF validation with DNS rebinding protection
-	_, _, err := security.Validate(rawURL)
 	if err != nil {
 		return fmt.Errorf("URL validation failed: %w", err)
 	}

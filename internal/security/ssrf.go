@@ -19,8 +19,11 @@ import (
 // Validate into the custom DialContext, preventing DNS rebinding attacks.
 type pinnedIPKey struct{}
 
-// allowLoopbackForTest is a test-only bypass. Production code MUST never set
-// this flag. Exposed via SetAllowLoopbackForTest exclusively for *_test.go.
+// allowLoopbackForTest is a test-only bypass that flips the default Validate
+// call to allow loopback/private addresses. Production code MUST never set
+// this flag — use ValidateAllowLoopback for the production-callable narrow
+// relaxation that keeps the same safety envelope. Exposed via
+// SetAllowLoopbackForTest exclusively for *_test.go.
 // atomic.Bool keeps read/write safe when tests spawn goroutines that trigger
 // outbound calls concurrently with the flag flip.
 var allowLoopbackForTest atomic.Bool
@@ -35,22 +38,25 @@ func SetAllowLoopbackForTest(allow bool) {
 	allowLoopbackForTest.Store(allow)
 }
 
-// blockedCIDRs lists all CIDRs that must never be dialed.
-var blockedCIDRs []*net.IPNet
+// criticalCIDRs lists ranges that must NEVER be dialed regardless of mode.
+// These include cloud-metadata endpoints (the AWS/GCP/Azure 169.254.169.254
+// case), multicast, and unspecified addresses. Relaxing these would expose
+// IAM credentials and other infrastructure regardless of whether the caller
+// is "in dev mode" — so the allowLoopback bypass on validate() does NOT
+// relax them.
+var criticalCIDRs []*net.IPNet
+
+// loopbackPrivateCIDRs lists loopback and RFC 1918 private ranges. These are
+// blocked by default but can be relaxed via validate(rawURL, allowLoopback=true)
+// for local dev workflows where httptest or single-machine MCP servers
+// legitimately need to be reachable.
+var loopbackPrivateCIDRs []*net.IPNet
 
 func init() {
-	cidrs := []string{
-		// Loopback
-		"127.0.0.0/8",
-		"::1/128",
+	critical := []string{
 		// Link-local (includes cloud-metadata 169.254.169.254)
 		"169.254.0.0/16",
 		"fe80::/10",
-		// Private (RFC 1918 + RFC 4193)
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"fc00::/7",
 		// Multicast
 		"224.0.0.0/4",
 		"ff00::/8",
@@ -58,23 +64,58 @@ func init() {
 		"0.0.0.0/32",
 		"::/128",
 	}
-	for _, cidr := range cidrs {
+	loopbackPrivate := []string{
+		// Loopback
+		"127.0.0.0/8",
+		"::1/128",
+		// Private (RFC 1918 + RFC 4193)
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7",
+	}
+	for _, cidr := range critical {
 		_, ipNet, err := net.ParseCIDR(cidr)
 		if err != nil {
-			panic(fmt.Sprintf("security: bad CIDR %q: %v", cidr, err))
+			panic(fmt.Sprintf("security: bad critical CIDR %q: %v", cidr, err))
 		}
-		blockedCIDRs = append(blockedCIDRs, ipNet)
+		criticalCIDRs = append(criticalCIDRs, ipNet)
+	}
+	for _, cidr := range loopbackPrivate {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(fmt.Sprintf("security: bad loopback/private CIDR %q: %v", cidr, err))
+		}
+		loopbackPrivateCIDRs = append(loopbackPrivateCIDRs, ipNet)
 	}
 }
 
-// isBlocked returns true if ip falls within any blocked CIDR.
-func isBlocked(ip net.IP) bool {
-	for _, cidr := range blockedCIDRs {
+// isCritical returns true if ip is in an always-blocked range (cloud metadata,
+// multicast, unspecified). These are never relaxable.
+func isCritical(ip net.IP) bool {
+	for _, cidr := range criticalCIDRs {
 		if cidr.Contains(ip) {
 			return true
 		}
 	}
 	return false
+}
+
+// isLoopbackOrPrivate returns true if ip is in a loopback or RFC 1918 range.
+// These are blocked by default but can be opted into via allowLoopback.
+func isLoopbackOrPrivate(ip net.IP) bool {
+	for _, cidr := range loopbackPrivateCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isBlocked returns true if ip is in any blocked range under strict mode
+// (the union of critical + loopback/private). Used when allowLoopback=false.
+func isBlocked(ip net.IP) bool {
+	return isCritical(ip) || isLoopbackOrPrivate(ip)
 }
 
 // redactURL strips query string and userinfo for safe logging.
@@ -100,7 +141,27 @@ func Validate(rawURL string) (*url.URL, net.IP, error) {
 	return validate(rawURL, allowLoopbackForTest.Load())
 }
 
-// validate is the internal implementation; allowLoopback is set only in tests.
+// ValidateAllowLoopback is identical to Validate but additionally accepts
+// loopback (127.0.0.0/8, ::1) and RFC 1918 private addresses (10/8, 172.16/12,
+// 192.168/16, fc00::/7). All other safety checks remain in force: URL parse,
+// scheme allowlist (http/https only), empty-host rejection, DNS resolution
+// with IP pinning (DNS-rebinding protection), and — critically — the
+// always-blocked CIDRs (link-local incl. cloud-metadata 169.254.169.254,
+// multicast, unspecified).
+//
+// This is the production-callable counterpart to SetAllowLoopbackForTest,
+// intended for narrow opt-in by features that legitimately need to dial
+// localhost or LAN addresses (e.g. single-machine MCP server registration in
+// local dev). Callers MUST gate this behind their own explicit configuration
+// so the relaxation is scoped to specific code paths, not blanket.
+func ValidateAllowLoopback(rawURL string) (*url.URL, net.IP, error) {
+	return validate(rawURL, true)
+}
+
+// validate is the internal implementation. When allowLoopback is true,
+// loopback + RFC 1918 ranges are permitted, but critical CIDRs (cloud
+// metadata, multicast, unspecified) and all non-CIDR safety checks remain in
+// force.
 func validate(rawURL string, allowLoopback bool) (*url.URL, net.IP, error) {
 	redacted := redactURL(rawURL)
 
@@ -123,7 +184,11 @@ func validate(rawURL string, allowLoopback bool) (*url.URL, net.IP, error) {
 
 	// If the host is already a literal IP, validate it directly.
 	if ip := net.ParseIP(host); ip != nil {
-		if !allowLoopback && isBlocked(ip) {
+		if isCritical(ip) {
+			slog.Warn("security.hook.ssrf_block", "url", redacted, "reason", "critical_blocked_ip", "ip", ip.String())
+			return nil, nil, fmt.Errorf("ssrf: IP %s in always-blocked range (cloud metadata/multicast/unspecified)", ip)
+		}
+		if !allowLoopback && isLoopbackOrPrivate(ip) {
 			slog.Warn("security.hook.ssrf_block", "url", redacted, "reason", "blocked_ip", "ip", ip.String())
 			return nil, nil, fmt.Errorf("ssrf: IP %s is in a blocked range", ip)
 		}
@@ -146,7 +211,11 @@ func validate(rawURL string, allowLoopback bool) (*url.URL, net.IP, error) {
 		return nil, nil, fmt.Errorf("ssrf: resolved address %q is not a valid IP", addrs[0])
 	}
 
-	if !allowLoopback && isBlocked(ip) {
+	if isCritical(ip) {
+		slog.Warn("security.hook.ssrf_block", "url", redacted, "reason", "critical_blocked_resolved_ip", "host", host, "ip", ip.String())
+		return nil, nil, fmt.Errorf("ssrf: %q resolved to always-blocked IP %s (cloud metadata/multicast/unspecified)", host, ip)
+	}
+	if !allowLoopback && isLoopbackOrPrivate(ip) {
 		slog.Warn("security.hook.ssrf_block", "url", redacted, "reason", "blocked_resolved_ip", "host", host, "ip", ip.String())
 		return nil, nil, fmt.Errorf("ssrf: %q resolved to blocked IP %s", host, ip)
 	}
