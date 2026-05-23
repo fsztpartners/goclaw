@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/nextlevelbuilder/goclaw/internal/security"
@@ -261,6 +262,71 @@ func TestValidateHeaders_EnvVarCheck(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateURL_AllowLoopback_NarrowRelaxation locks in the contract for
+// the GOCLAW_MCP_ALLOW_LOOPBACK escape hatch: flag-off matches strict
+// production behavior; flag-on permits loopback + RFC 1918 but keeps cloud
+// metadata, multicast, non-http schemes, and empty hosts blocked. This is
+// the partition that makes the env-var name honest.
+func TestValidateURL_AllowLoopback_NarrowRelaxation(t *testing.T) {
+	// Package init flips the security layer's test bypass on; flip it off so
+	// these cases exercise the same path production would take.
+	security.SetAllowLoopbackForTest(false)
+	defer security.SetAllowLoopbackForTest(true)
+
+	tests := []struct {
+		name             string
+		mcpFlag          bool
+		url              string
+		wantErr          bool
+		wantErrSubstring string
+	}{
+		// Flag OFF — strict mode (production default).
+		{"flag off / loopback IPv4 rejected", false, "http://127.0.0.1/mcp", true, "blocked range"},
+		{"flag off / loopback IPv6 rejected", false, "http://[::1]/mcp", true, "blocked range"},
+		{"flag off / RFC1918 rejected", false, "http://192.168.1.42/mcp", true, "blocked range"},
+		{"flag off / cloud metadata rejected", false, "http://169.254.169.254/latest", true, "always-blocked"},
+		{"flag off / file scheme rejected", false, "file:///etc/passwd", true, "scheme"},
+
+		// Flag ON — loopback + RFC 1918 accepted.
+		{"flag on / loopback IPv4 accepted", true, "http://127.0.0.1/mcp", false, ""},
+		{"flag on / loopback IPv6 accepted", true, "http://[::1]/mcp", false, ""},
+		{"flag on / RFC1918 10.x accepted", true, "http://10.0.0.1/mcp", false, ""},
+		{"flag on / RFC1918 172.16 accepted", true, "http://172.16.0.1/mcp", false, ""},
+		{"flag on / RFC1918 192.168 accepted", true, "http://192.168.1.42/mcp", false, ""},
+
+		// Flag ON — critical CIDRs still blocked (this is the whole point).
+		{"flag on / cloud metadata STILL rejected", true, "http://169.254.169.254/latest/meta-data", true, "always-blocked"},
+		{"flag on / link-local STILL rejected", true, "http://169.254.1.1/x", true, "always-blocked"},
+		{"flag on / multicast STILL rejected", true, "http://224.0.0.1/x", true, "always-blocked"},
+		{"flag on / unspecified STILL rejected", true, "http://0.0.0.0/x", true, "always-blocked"},
+
+		// Flag ON — non-CIDR safety checks still in force.
+		{"flag on / file scheme STILL rejected", true, "file:///etc/passwd", true, "scheme"},
+		{"flag on / gopher scheme STILL rejected", true, "gopher://127.0.0.1/x", true, "scheme"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetAllowLoopbackForTest(tt.mcpFlag)
+			defer SetAllowLoopbackForTest(false)
+
+			err := ValidateURL(tt.url)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ValidateURL(%q) = nil, want error", tt.url)
+				}
+				if tt.wantErrSubstring != "" && !strings.Contains(err.Error(), tt.wantErrSubstring) {
+					t.Errorf("ValidateURL(%q) error %q does not contain %q", tt.url, err.Error(), tt.wantErrSubstring)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("ValidateURL(%q) unexpected error: %v", tt.url, err)
 			}
 		})
 	}
