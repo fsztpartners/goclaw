@@ -499,6 +499,25 @@ func (s *Server) SetMediaServeHandler(h *httpapi.MediaServeHandler) {
 // SetMemoryHandler sets the memory management handler.
 func (s *Server) SetMemoryHandler(h *httpapi.MemoryHandler) { s.handlers = append(s.handlers, h) }
 
+// SetKBHandler sets the knowledge-base (brand KB) handler.
+func (s *Server) SetKBHandler(h *httpapi.KBHandler) { s.handlers = append(s.handlers, h) }
+
+// RegisterRouteRegistrar accepts any object with a RegisterRoutes(mux) method.
+// Phase 9 uses this to plug the Prometheus /metrics handler into the existing
+// route-loop without growing the typed Set*Handler surface for every new
+// observability adapter.
+func (s *Server) RegisterRouteRegistrar(h interface {
+	RegisterRoutes(mux *http.ServeMux)
+}) {
+	s.handlers = append(s.handlers, h)
+}
+
+// SetTriviaHandler sets the Phase 3 shadow-trivia manual-trigger handler.
+func (s *Server) SetTriviaHandler(h *httpapi.TriviaHandler) { s.handlers = append(s.handlers, h) }
+
+// SetKGHandler sets the Phase 5 KB-side KG extract/run handler.
+func (s *Server) SetKGHandler(h *httpapi.KGHandler) { s.handlers = append(s.handlers, h) }
+
 // SetKnowledgeGraphHandler sets the knowledge graph handler.
 func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) {
 	s.handlers = append(s.handlers, h)

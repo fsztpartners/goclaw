@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/auth"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/crypto"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
@@ -83,6 +84,14 @@ var pkgAPIKeyCache *apiKeyCache
 var pkgPairingStore store.PairingStore
 var pkgTenantCache *tenantCache
 var pkgOwnerIDs []string
+var pkgJWTVerifier *auth.Verifier
+
+// InitJWTVerifier installs an RS256 JWT verifier on the auth dispatch chain.
+// Pass nil to disable (default). Must be called once during server startup
+// before handling requests.
+func InitJWTVerifier(v *auth.Verifier) {
+	pkgJWTVerifier = v
+}
 
 // InitGatewayToken sets the gateway bearer token for HTTP auth.
 // Must be called once during server startup before handling requests.
@@ -150,13 +159,48 @@ func ResolveAPIKey(ctx context.Context, token string) (*store.APIKeyData, permis
 	return pkgAPIKeyCache.getOrFetch(ctx, hash)
 }
 
+// mapJWTRole translates the role claim from an external JWT into a GoClaw
+// permissions.Role. Unknown values fall back to viewer (least privileged).
+func mapJWTRole(role string) permissions.Role {
+	switch role {
+	case "owner":
+		return permissions.RoleOwner
+	case "admin":
+		return permissions.RoleAdmin
+	case "member":
+		return permissions.RoleOperator
+	case "viewer":
+		return permissions.RoleViewer
+	default:
+		return permissions.RoleViewer
+	}
+}
+
+// roleRank returns a privilege ordering for permissions.Role so the JWT path
+// can take the floor of (claim role, DB role) — DB always wins on disagreement.
+// Higher = more privileged.
+func roleRank(r permissions.Role) int {
+	switch r {
+	case permissions.RoleOwner:
+		return 4
+	case permissions.RoleAdmin:
+		return 3
+	case permissions.RoleOperator:
+		return 2
+	case permissions.RoleViewer:
+		return 1
+	}
+	return 0
+}
+
 // authResult holds the resolved authentication state for an HTTP request.
 type authResult struct {
-	Role          permissions.Role
-	Authenticated bool
-	KeyData       *store.APIKeyData // non-nil when authenticated via API key
-	TenantID      uuid.UUID         // resolved tenant; always concrete after resolution
-	TenantSlug    string            // resolved tenant slug for filesystem paths
+	Role           permissions.Role
+	Authenticated  bool
+	KeyData        *store.APIKeyData // non-nil when authenticated via API key
+	TenantID       uuid.UUID         // resolved tenant; always concrete after resolution
+	TenantSlug     string            // resolved tenant slug for filesystem paths
+	UserIDOverride string            // when non-empty, supersedes the X-GoClaw-User-Id header in enrichContext (JWT path)
 }
 
 // resolveAuth determines the caller's role from the request.
@@ -194,6 +238,54 @@ func resolveAuthWithBearer(r *http.Request, bearer string) authResult {
 		}
 		res.TenantSlug = resolveTenantSlug(r.Context(), res.TenantID)
 		return res
+	}
+	// External JWT (RS256) → role from token + tenant from org_id claim.
+	// Tried before API key so a bearer that happens to look like a JWT isn't
+	// mistakenly treated as an opaque API key.
+	if pkgJWTVerifier != nil && bearer != "" && auth.LooksLikeJWT(bearer) {
+		claims, err := pkgJWTVerifier.Verify(r.Context(), bearer)
+		if err == nil && claims != nil {
+			role := mapJWTRole(claims.Role)
+			// DB-vs-claim role check. The claim is just a hint; the tenant_users
+			// row is authoritative. If membership is missing → reject (the user
+			// was removed from the org since the token was issued). If the DB
+			// role is lower-privileged than the claim → downgrade to the DB role.
+			// We never *elevate* — a claim saying "owner" against a DB "viewer"
+			// becomes viewer.
+			if pkgTenantCache != nil {
+				dbRole, derr := pkgTenantCache.store.GetUserRole(r.Context(), claims.OrgID, claims.Subject)
+				if derr != nil || dbRole == "" {
+					slog.Warn("security.jwt_user_not_member",
+						"tenant", claims.OrgID.String(),
+						"user", claims.Subject,
+						"err", derr,
+					)
+					return authResult{}
+				}
+				dbMapped := mapJWTRole(dbRole)
+				if roleRank(dbMapped) < roleRank(role) {
+					slog.Info("security.jwt_role_downgraded",
+						"tenant", claims.OrgID.String(),
+						"user", claims.Subject,
+						"claim", string(role),
+						"db", string(dbMapped),
+					)
+					role = dbMapped
+				}
+			}
+			res := authResult{
+				Role:           role,
+				Authenticated:  true,
+				TenantID:       claims.OrgID,
+				UserIDOverride: claims.Subject,
+			}
+			res.TenantSlug = resolveTenantSlug(r.Context(), res.TenantID)
+			return res
+		}
+		if err != nil {
+			slog.Debug("security.http_jwt_verify_failed", "error", err)
+		}
+		// fall through to next auth path
 	}
 	// API key → role from scopes
 	if keyData, role := ResolveAPIKey(r.Context(), bearer); role != "" {
@@ -316,6 +408,10 @@ func enrichContext(ctx context.Context, r *http.Request, auth authResult) contex
 	ctx = store.WithLocale(ctx, extractLocale(r))
 	ctx = store.WithRole(ctx, string(auth.Role))
 	userID := extractUserID(r)
+	// JWT path: claim.sub overrides anything the header said.
+	if auth.UserIDOverride != "" {
+		userID = auth.UserIDOverride
+	}
 	// Security: In dev mode (no gateway token configured), do not trust the
 	// X-GoClaw-User-Id header — force "system" to prevent identity spoofing.
 	if pkgGatewayToken == "" && auth.KeyData == nil && userID != "" {

@@ -7,9 +7,16 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/coherence"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
+	"github.com/nextlevelbuilder/goclaw/internal/kb"
+	"github.com/nextlevelbuilder/goclaw/internal/kbmetrics"
+	"github.com/nextlevelbuilder/goclaw/internal/kg"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
+	"github.com/nextlevelbuilder/goclaw/internal/retrieval/pagerank"
+	"github.com/nextlevelbuilder/goclaw/internal/router"
+	"github.com/nextlevelbuilder/goclaw/internal/trivia"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
@@ -157,6 +164,64 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 	// Memory management API
 	if d.pgStores != nil && d.pgStores.Memory != nil {
 		d.server.SetMemoryHandler(httpapi.NewMemoryHandler(d.pgStores.Memory))
+	}
+
+	// Knowledge-base API (brand KB; bypasses dreaming/episodic/semantic workers)
+	var kbStore *kb.Store
+	var kgStore *kg.Store
+	if d.pgStores != nil && d.pgStores.DB != nil {
+		kbStore = kb.NewStore(d.pgStores.DB)
+		// Phase 5: wire the Haiku classifier-driven router and the PPR retriever.
+		// Phase 8: wire the domain event bus so kb.Store.{Ingest,Supersede,Purge}
+		// emit coherence events. Subscribers (cache invalidator, re-embed enqueuer,
+		// PPR cache buster) live in internal/coherence and are wired below.
+		kbStore = kbStore.
+			WithRouter(router.NewRouter(router.NewHaikuClassifier())).
+			WithHippoRAG(pagerank.New(d.pgStores.DB)).
+			WithEventBus(d.domainBus)
+		kgStore = kg.NewStore(d.pgStores.DB)
+		d.server.SetKBHandler(httpapi.NewKBHandler(kbStore).WithKGStore(kgStore).WithEventBus(d.domainBus))
+
+		// Phase 9: Prometheus /metrics endpoint. Register once; safe to call
+		// even if the gateway boots without the KB substrate — the metrics
+		// stay at zero but the scrape target is alive.
+		kbmetrics.MustRegister()
+		d.server.RegisterRouteRegistrar(kbmetrics.RouteHandler{})
+		slog.Info("kbmetrics: /metrics endpoint registered")
+
+		// Phase 8: coherence subscribers — in-process, fire-and-forget, sub-ms p95.
+		coherenceSub := coherence.NewSubscriber(
+			coherence.NewInvalidator(),
+			coherence.NewPgReembedEnqueuer(d.pgStores.DB),
+			coherence.NoopPPR{}, // PPR cache deferred (P5.3); swap when cache lands.
+		)
+		coherenceSub.Register(d.domainBus)
+		slog.Info("coherence: subscribers registered", "events",
+			[]string{"kb.doc.updated", "kb.doc.deleted", "kb.adapter.swapped", "kb.entity.merged", "kb.tenant.purged"})
+
+		// Phase 5 KG worker (Sonnet OpenIE on kb.kg_extract_jobs).
+		// Skipped if ANTHROPIC_API_KEY missing (extractor will refuse anyway).
+		extractor := kg.NewSonnetExtractor()
+		worker := kg.NewWorker(kgStore, extractor)
+		d.server.SetKGHandler(httpapi.NewKGHandler(kgStore, worker, extractor))
+		// 5-min interval drains up to 50 jobs each pass.
+		kgTicker := kg.NewTicker(worker, 5*time.Minute, 50)
+		kgTicker.Start(context.Background())
+		slog.Info("kg: ticker started", "interval", "5m", "limit", 50)
+	}
+
+	// Phase 3 trivia shadow loop — manual-trigger endpoint + daily ticker.
+	// Skipped when the optional VOYAGE_API_KEY / ANTHROPIC_API_KEY aren't set
+	// (production tenants without trivia won't break, just won't log new rows).
+	if kbStore != nil && d.pgStores != nil && d.pgStores.DB != nil {
+		triviaStore := trivia.NewStore(d.pgStores.DB)
+		runner := trivia.NewRunner(triviaStore, kbStore, trivia.NewVoyageEmbedder(), trivia.NewAnthropicGenerator())
+		d.server.SetTriviaHandler(httpapi.NewTriviaHandler(runner))
+		// Daily ticker. 24h interval matches the Phase 3 plan; first run fires
+		// 5 minutes after gateway boot. Start spawns a background goroutine.
+		ticker := trivia.NewTicker(runner, triviaStore, 24*time.Hour)
+		ticker.Start(context.Background())
+		slog.Info("trivia: ticker started", "interval", "24h")
 	}
 
 	// Knowledge graph API
