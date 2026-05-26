@@ -331,6 +331,7 @@ func runGateway() {
 		mcpToolLister = mcpMgr
 	}
 	httpapi.InitGatewayToken(cfg.Gateway.Token)
+	initJWTVerifierFromDB(pgStores)
 	exportTokenStore := httpapi.InitExportTokenStore()
 	defer exportTokenStore.Stop()
 	agentsH, skillsH, tracesH, mcpH, channelInstancesH, providersH, builtinToolsH, pendingMessagesH, teamEventsH, secureCLIH, secureCLIGrantH, mcpUserCredsH := wireHTTP(pgStores, cfg.Agents.Defaults.Workspace, dataDir, bundledSkillsDir, msgBus, toolsReg, providerRegistry, modelReg, permPE.IsOwner, gatewayAddr, mcpToolLister)

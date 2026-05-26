@@ -27,6 +27,14 @@ const (
 	EventDelegateCompleted EventType = "delegate.completed"
 	EventDelegateFailed    EventType = "delegate.failed"
 
+	// KB coherence events (Phase 8 — propagate corpus mutations to subscribers
+	// that hold derived state: classifier intent cache, HippoRAG entity-seed
+	// cache, re-embed queue, agent-side context caches.)
+	EventKBDocUpdated     EventType = "kb.doc.updated"
+	EventKBDocDeleted     EventType = "kb.doc.deleted"
+	EventKBAdapterSwapped EventType = "kb.adapter.swapped"
+	EventKBEntityMerged   EventType = "kb.entity.merged"
+	EventKBTenantPurged   EventType = "kb.tenant.purged"
 )
 
 // DomainEvent is a typed event with metadata for the consolidation pipeline.
@@ -125,6 +133,48 @@ type ContextPrunedPayload struct {
 	ResultsCleared int    // hard-cleared count
 	Compacted      bool
 	Trigger        string // "soft" | "hard" | "compact"
+}
+
+// --- Phase 8 KB coherence payloads ---
+
+// KBDocChangedPayload is the shared shape for kb.doc.updated and kb.doc.deleted.
+// Subscribers use TenantID + DocID + ChunkIDs to invalidate caches and queue
+// re-embed work. AffectedDepartments lets per-department subscribers (e.g. a
+// router-strategy cache keyed by department) scope their invalidation.
+type KBDocChangedPayload struct {
+	DocID                string
+	DocHash              string
+	DocVersion           string
+	Department           string
+	Visibility           string // "public" | "internal"
+	ChunkIDs             []string
+	AffectedDepartments  []string
+	Reason               string // "ingest" | "supersede" | "purge"
+}
+
+// KBAdapterSwappedPayload — a tenant's embedding adapter changed; downstream
+// caches keyed on embedding_model_id must invalidate, and chunks ingested
+// before the swap may need re-embed (handled by the re-embed enqueuer).
+type KBAdapterSwappedPayload struct {
+	AdapterID        string
+	BaseModel        string
+	EmbeddingModelID string // base+adapter composite
+	PreviousAdapter  string
+}
+
+// KBEntityMergedPayload — KG merge event. PPR caches keyed on entity IDs
+// must invalidate.
+type KBEntityMergedPayload struct {
+	KeptEntityID    string
+	MergedEntityIDs []string
+}
+
+// KBTenantPurgedPayload — fired after a successful GDPR / churn purge.
+// Subscribers should drop *every* cached datum for this tenant.
+type KBTenantPurgedPayload struct {
+	PurgeAuditID string
+	CountsJSON   string // JSON encoded per-table counts
+	Reason       string
 }
 
 // VaultDocUpsertedPayload is emitted after a vault document is registered/updated.
