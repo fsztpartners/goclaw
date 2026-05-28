@@ -1,0 +1,90 @@
+name: deploy
+
+# Triggers on push to the deploy branch (dev for fsztpartners/goclaw — see
+# tracker.md Phase 1 A11). OIDC role gha-goclaw-deployer is pinned to this
+# repo:ref combination in its trust policy.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-prod-goclaw
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: goclaw
+  ECS_CLUSTER: fzst-claw
+  ECS_SERVICE: goclaw
+  CONTAINER_NAME: goclaw
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::506953261627:role/gha-goclaw-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Force linux/amd64. Fargate task defs pin cpu_architecture = X86_64
+      # (see phase4-services/learnings.md #3); a default-arch build from a
+      # different runner would CannotPullContainer at task start.
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --provenance false \
+            -t "$REGISTRY/$ECR_REPO:$IMAGE_TAG" \
+            .
+          docker push "$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          echo "image=$REGISTRY/$ECR_REPO:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Render task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: .aws/task-goclaw.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      # goclaw is private-only behind a security group. We can't curl it from
+      # a GHA runner. The deploy action's wait-for-service-stability already
+      # blocks until desiredCount == runningCount and circuit breaker is
+      # quiet — that's the deploy gate. A deeper smoke would need a bastion
+      # task (Phase 6 candidate).
+      - name: Confirm steady state
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+          SERVICE: ${{ env.ECS_SERVICE }}
+        run: |
+          aws ecs describe-services \
+            --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].{desired:desiredCount,running:runningCount,deployments:length(deployments)}' \
+            --output table
