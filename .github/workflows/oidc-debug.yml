@@ -1,0 +1,38 @@
+name: oidc-debug
+
+# Temporary: pull the actual OIDC token GitHub is minting for this repo+ref
+# and decode its claims. Compare the `sub` and `aud` against the trust policy
+# on gha-goclaw-deployer. Delete this workflow once the structural mismatch
+# is identified.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  show-claims:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint OIDC token and decode claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com');
+            const [header, payload] = token.split('.').slice(0, 2).map(p =>
+              JSON.parse(Buffer.from(p.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+            );
+            core.info('=== JWT header ===');
+            core.info(JSON.stringify(header, null, 2));
+            core.info('=== JWT payload (claims) ===');
+            core.info(JSON.stringify(payload, null, 2));
+            core.info('=== Key claims ===');
+            core.info(`sub: ${payload.sub}`);
+            core.info(`aud: ${payload.aud}`);
+            core.info(`iss: ${payload.iss}`);
+            core.info(`repository: ${payload.repository}`);
+            core.info(`ref: ${payload.ref}`);
+            core.info(`event_name: ${payload.event_name}`);
+            core.info(`actor: ${payload.actor}`);
