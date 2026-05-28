@@ -36,6 +36,15 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::506953261627:role/gha-goclaw-deployer
           aws-region: ${{ env.AWS_REGION }}
+          # role-skip-session-tagging: the action otherwise sets PrincipalTag
+          # session tags on the AssumeRoleWithWebIdentity call (Repository,
+          # Workflow, Action, Branch). The trust policy on gha-goclaw-deployer
+          # doesn't authorize sts:TagSession with those specific tag keys,
+          # which makes STS deny the WHOLE call (even when the sub matches).
+          # A raw `aws sts assume-role-with-web-identity` from inside this
+          # same runner+token succeeds. Skipping tagging makes the action call
+          # match the raw shape. See phase5-cicd/learnings.md.
+          role-skip-session-tagging: true
 
       - name: Login to Amazon ECR
         id: ecr
