@@ -36,3 +36,15 @@ jobs:
             core.info(`ref: ${payload.ref}`);
             core.info(`event_name: ${payload.event_name}`);
             core.info(`actor: ${payload.actor}`);
+            core.exportVariable('OIDC_TOKEN', token);
+
+      - name: Try assume-role-with-web-identity directly
+        run: |
+          set +e
+          aws sts assume-role-with-web-identity \
+            --role-arn arn:aws:iam::506953261627:role/gha-goclaw-deployer \
+            --role-session-name oidc-debug \
+            --web-identity-token "$OIDC_TOKEN" \
+            --region us-east-1 \
+            2>&1 | tee /tmp/sts.out
+          echo "exit: $?"
