@@ -1,0 +1,91 @@
+name: goclaw-upgrade
+
+# Runs `goclaw upgrade` as a one-shot ECS task. The goclaw binary embeds its
+# migrations dir, so re-using the production image with a command override is
+# the simplest way to ship a schema bump without installing goclaw on the runner.
+#
+# Bumping a migration also requires bumping RequiredSchemaVersion in
+# internal/upgrade/version.go and re-deploying — see project memory
+# "goclaw_schema_version_bump". Order: merge code → deploy.yml runs →
+# goclaw-upgrade runs. Reverse and goclaw boot will fail the schema check.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: goclaw-upgrade-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: fzst-claw
+  TASK_FAMILY: goclaw
+  CONTAINER_NAME: goclaw
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    environment: production-migrate
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::506953261627:role/gha-goclaw-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Subnet/SG IDs come from Terraform outputs and are stored as
+      # *repository variables* (not secrets — non-sensitive). Set these in
+      # repo Settings → Variables:
+      #   GOCLAW_SUBNET_A   subnet-xxxxxxxx (private subnet a)
+      #   GOCLAW_SUBNET_B   subnet-yyyyyyyy (private subnet b)
+      #   GOCLAW_TASK_SG    sg-zzzzzzzz     (goclaw security group)
+      - name: Run goclaw upgrade as one-shot task
+        env:
+          CLUSTER: ${{ env.ECS_CLUSTER }}
+          TASK_DEF: ${{ env.TASK_FAMILY }}
+          CONTAINER: ${{ env.CONTAINER_NAME }}
+          SUBNET_A: ${{ vars.GOCLAW_SUBNET_A }}
+          SUBNET_B: ${{ vars.GOCLAW_SUBNET_B }}
+          TASK_SG: ${{ vars.GOCLAW_TASK_SG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUBNET_A:-}" ] || [ -z "${SUBNET_B:-}" ] || [ -z "${TASK_SG:-}" ]; then
+            echo "GOCLAW_SUBNET_A / GOCLAW_SUBNET_B / GOCLAW_TASK_SG repo vars must be set" >&2
+            exit 1
+          fi
+
+          overrides=$(jq -nc \
+            --arg name "$CONTAINER" \
+            '{containerOverrides:[{name:$name,command:["goclaw","upgrade"]}]}')
+
+          net=$(jq -nc \
+            --arg a "$SUBNET_A" --arg b "$SUBNET_B" --arg sg "$TASK_SG" \
+            '{awsvpcConfiguration:{subnets:[$a,$b],securityGroups:[$sg],assignPublicIp:"DISABLED"}}')
+
+          task_arn=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --network-configuration "$net" \
+            --overrides "$overrides" \
+            --query 'tasks[0].taskArn' --output text)
+
+          echo "Started one-shot task: $task_arn"
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task_arn"
+
+          # Surface exit code + final status so a failed migration fails the job.
+          aws ecs describe-tasks \
+            --cluster "$CLUSTER" --tasks "$task_arn" \
+            --query 'tasks[0].{lastStatus:lastStatus,stopCode:stopCode,stoppedReason:stoppedReason,containers:containers[].{name:name,exitCode:exitCode,reason:reason}}' \
+            --output json | tee /tmp/upgrade-result.json
+
+          exit_code=$(jq -r '.containers[] | select(.name=="'"$CONTAINER"'") | .exitCode' /tmp/upgrade-result.json)
+          if [ "$exit_code" != "0" ]; then
+            echo "goclaw upgrade exited non-zero ($exit_code)" >&2
+            exit 1
+          fi
