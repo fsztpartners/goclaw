@@ -36,6 +36,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::506953261627:role/gha-goclaw-deployer
           aws-region: ${{ env.AWS_REGION }}
+          # See deploy.yml — action's default session-tagging gets denied by
+          # STS; skipping makes the call shape match the working raw form.
+          role-skip-session-tagging: true
 
       # Subnet/SG IDs come from Terraform outputs and are stored as
       # *repository variables* (not secrets — non-sensitive). Set these in
