@@ -26,6 +26,7 @@ const (
 	RoleCustomerCare  = "customer_care"
 	RoleMarketing     = "marketing"
 	RolePublic        = "public"
+	RoleSocial        = "social"
 )
 
 // prefixTemplates maps a role to its instruction prefix. {query} is the
@@ -38,6 +39,7 @@ var prefixTemplates = map[string]string{
 	RoleCustomerCare: "As a customer-care agent helping a customer with {context}: {query}",
 	RoleMarketing:    "As a marketing copywriter producing brand-aligned copy about {context}: {query}",
 	RolePublic:       "As a public-facing assistant answering a visitor question: {query}",
+	RoleSocial:       "As the brand's social-media voice writing about {context}: {query}",
 }
 
 // FormatPrefix renders the prefix template for a role. Unknown roles return
@@ -64,6 +66,8 @@ func defaultContextFor(role string) string {
 		return "their issue"
 	case RoleMarketing:
 		return "the brand"
+	case RoleSocial:
+		return "the brand"
 	}
 	return ""
 }
@@ -77,6 +81,7 @@ func AllRoles() []string {
 		RoleCustomerCare,
 		RoleMarketing,
 		RolePublic,
+		RoleSocial,
 	}
 }
 
