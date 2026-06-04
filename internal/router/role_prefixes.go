@@ -20,13 +20,26 @@ import (
 
 // Role identifiers. Match the values stored in kb_chunks.role_tags.
 const (
-	RoleSales         = "sales"
-	RoleHRInternal    = "hr_internal"
-	RoleHRRecruiter   = "hr_recruiter"
-	RoleCustomerCare  = "customer_care"
-	RoleMarketing     = "marketing"
-	RolePublic        = "public"
-	RoleSocial        = "social"
+	RoleSales        = "sales"
+	RoleHRInternal   = "hr_internal"
+	RoleHRRecruiter  = "hr_recruiter"
+	RoleCustomerCare = "customer_care"
+	// RoleMarketing is the umbrella / aggregator role — it synthesizes
+	// across the sub-departments under marketing (social-media today;
+	// more siblings landing later: ads, email/CRM, SEO, etc.) and produces
+	// long-form brand copy at the org level. Think "marketing director
+	// pulling a status update across the channels they own."
+	RoleMarketing = "marketing"
+	RolePublic    = "public"
+	// RoleSocial is one of the leaf departments that sits under the
+	// marketing umbrella (RoleMarketing). It owns the platform-native
+	// short-form voice + the inbox/reply/growth-action pipeline; it has
+	// its own dept_registry entry, brand profile, operator context, and
+	// jobs/workers in fzst-claw. Kept as a distinct role (not a flavor of
+	// marketing) so the prefix can carry the platform-voice framing and
+	// so future sibling sub-depts (e.g. ads, email) plug in alongside it
+	// without disturbing RoleMarketing's aggregator role.
+	RoleSocial = "social"
 )
 
 // prefixTemplates maps a role to its instruction prefix. {query} is the
